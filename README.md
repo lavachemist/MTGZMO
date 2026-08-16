@@ -12,8 +12,9 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - TMC5160 stepper driver in StealthChop velocity mode — speed tracks encoder RPM via hob/gear ratio, corrected for belt/pulley gearing
 - Stepper driver abstraction — swap to a different driver by replacing two functions only
 - Yaskawa A1000 VFD control over MEMOBUS/Modbus RTU (RS-485): run forward, run reverse, stop, set speed, fault reset
-- Physical VFD controls: Start/Stop toggle button, Reverse button, Stop button, potentiometer for continuous speed adjustment (0–max Hz), hardware lockout switch for web controls (GPIO 22)
+- Physical VFD controls: Start/Stop toggle button, Reverse button, Stop button, potentiometer for continuous speed adjustment (0–max Hz), fail-safe lockout jumper for web controls (GPIO 22)
 - VFD fault monitoring — on-screen overlay on any new trip, and on fault clearance
+- **Safety**: the VFD is force-stopped on every controller boot/reset (a crash or reflash never leaves the spindle running unattended); the web lockout jumper is enforced server-side and fails safe (absent/disconnected = locked, not just greyed-out buttons); all state-changing web endpoints reject cross-site requests (CSRF) via an Origin check — Stop is never blocked by either mechanism
 - WiFi web UI at **`http://gizmo.mt`** (AP mode) to adjust all parameters at runtime
 - AP mode SSID `MTGizmo` — no router needed; captive portal auto-opens browser on connect
 - Station mode support with automatic fallback to AP if connection fails
@@ -126,7 +127,7 @@ All buttons wire the same way: one leg to the GPIO, other leg to GND. All use th
 | VFD Reverse | GPIO 5 | Pin 7 | Press sends Reverse command |
 | VFD Stop | GPIO 6 | Pin 9 | Press sends Stop command |
 | RPM Source | GPIO 16 | Pin 21 | Hold LOW to show VFD RPM on display; open (HIGH) for encoder RPM |
-| Web Lockout | GPIO 22 | Pin 29 | Hold LOW to disable all web VFD controls (speed input + run/stop/reverse/reset) |
+| Web Lockout | GPIO 22 | Pin 29 | Jumper to GND (LOW) to *unlock* web VFD controls; open/disconnected (HIGH) fails safe to *locked* |
 
 ### Potentiometer → Pico 2W
 
@@ -261,8 +262,8 @@ The UI has two tabs:
 
 ### Home tab
 
+- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms), current speed, and setpoint in RPM. Controls: RPM input + **Set RPM**, **▶ Forward**, **◀ Reverse**, **Stop ■**, **Reset** (fault reset). All controls except Stop (including speed input) are disabled in the UI — and rejected by the server, even via a direct request — unless the lockout jumper (GPIO 22) is present. The RPM is converted to a frequency command using the baseline scaling and capped at `vfd_max_hz` before sending via Modbus. Status auto-refreshes every 500 ms.
 - **Gear Ratio** card — enter *Threads on hob* and *Gear teeth*; the display shows the current ratio as `H : T`. Takes effect immediately and persists to EEPROM.
-- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms), current speed, and setpoint in RPM. Controls: RPM input + **Set RPM**, **▶ Forward**, **◀ Reverse**, **Stop ■**, **Reset** (fault reset). All controls (including speed input) are disabled when the hardware lockout button (GPIO 22) is held LOW. The RPM is converted to a frequency command using the baseline scaling and capped at `vfd_max_hz` before sending via Modbus. Status auto-refreshes every 500 ms.
 
 ### Settings tab
 
@@ -283,16 +284,20 @@ The UI has two tabs:
 | `/set-encoder` | POST | `reversed` (0/1) | Set encoder direction |
 | `/set-ppr` | POST | `ppr` | Set encoder PPR |
 | `/set-pulley` | POST | `driver`, `driven` | Set pulley tooth counts |
-| `/set-wifi` | GET | `mode`, `ssid`, `pass` | Configure WiFi |
+| `/set-wifi` | POST | `mode`, `ssid`, `pass` | Configure WiFi |
 | `/wifi-scan` | GET | — | Scan for WiFi networks; returns JSON array of SSIDs |
-| `/vfd-rpm` | POST | `rpm` | Set VFD speed in RPM (converted to Hz, capped at vfd_max_hz) |
-| `/vfd-run` | POST | — | Send run (forward) command to VFD |
-| `/vfd-reverse` | POST | — | Send run (reverse) command to VFD |
-| `/vfd-stop` | POST | — | Send stop command to VFD |
-| `/vfd-freq` | POST | `hz` (0.01 Hz units) | Set VFD frequency reference directly in 0.01 Hz units |
-| `/vfd-reset` | POST | — | Reset active VFD fault |
-| `/vfd-settings` | POST | `slave`, `maxhz`, `basehz`, `baserpm` | Set slave address, max/baseline frequency, baseline RPM |
+| `/vfd-rpm` | POST | `rpm` | Set VFD speed in RPM (converted to Hz, capped at vfd_max_hz) — locked, CSRF-checked |
+| `/vfd-run` | POST | — | Send run (forward) command to VFD — locked, CSRF-checked |
+| `/vfd-reverse` | POST | — | Send run (reverse) command to VFD — locked, CSRF-checked |
+| `/vfd-stop` | POST | — | Send stop command to VFD — always allowed, never locked or CSRF-checked |
+| `/vfd-freq` | POST | `hz` (0.01 Hz units) | Set VFD frequency reference directly in 0.01 Hz units — locked, CSRF-checked |
+| `/vfd-reset` | POST | — | Reset active VFD fault — locked, CSRF-checked |
+| `/vfd-settings` | POST | `slave`, `maxhz`, `basehz`, `baserpm` | Set slave address, max/baseline frequency, baseline RPM — locked, CSRF-checked |
 | `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, reverse, status, fault, freq, output_freq, base_hz, base_rpm, pot_active, web_lock}` |
+
+> **CSRF protection**: every state-changing endpoint above (all `/set*` and `/vfd*` POST routes except `/vfd-stop`) rejects the request with `403` if the browser-supplied `Origin` header doesn't match this device's own address — this stops a malicious or compromised page open in another tab from silently issuing commands to the mill. Requests with no `Origin` header at all (curl, scripts) are still allowed through, since there's no auth/token scheme to fall back on.
+>
+> **Locked** above means the endpoint also returns `403` unless the lockout jumper (GPIO 22) is present — see [Web lockout jumper](#web-lockout-jumper-gpio-22).
 
 ## Physical Controls
 
@@ -319,9 +324,11 @@ Sends Stop command. Edge-triggered.
 
 Hold LOW to display VFD RPM on the tachometer (read from the drive's output frequency register). Leave open (HIGH, default) to display encoder RPM. Switching between sources shows a brief "RPM: VFD" or "RPM: Encoder" overlay.
 
-### Web lockout button (GPIO 22)
+### Web lockout jumper (GPIO 22)
 
-Hold LOW to disable all VFD controls in the web UI: the speed input, Set RPM button, Forward, Reverse, Stop, and Reset buttons are all greyed out and non-functional. The hardware pot and physical buttons remain operational. The UI shows "Controls locked by hardware switch" below the buttons while active.
+`INPUT_PULLUP`, and **fail-safe**: the pin must be actively pulled LOW — by a jumper physically bridging it to GND — to *unlock* the web VFD controls. Any absence of that connection (jumper not installed, wire broken, connector unplugged) reads HIGH and defaults to *locked*. This is the opposite of a normal "hold to disable" switch on purpose — a safety interlock should fail toward the safe state, not the enabled one.
+
+While locked: the speed input, Set RPM, Forward, Reverse, and Reset are all greyed out and non-functional in the web UI — and rejected server-side with `403` even if requested directly (e.g. via `curl`), so the jumper is a real interlock, not just a UI hint. The hardware pot and physical buttons remain operational, and **Stop always works regardless of lockout state**. The UI shows "Controls locked — unlock jumper not present" below the buttons while locked.
 
 ### VFD speed potentiometer (GPIO 26 / ADC0)
 

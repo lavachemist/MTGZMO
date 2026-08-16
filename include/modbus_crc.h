@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+/* CRC-16/Modbus (poly 0xA001, init 0xFFFF) — appended little-endian
+   (low byte first) to every Modbus RTU frame, per the spec. */
 static inline uint16_t modbus_crc(const uint8_t *buf, uint8_t len)
 {
     uint16_t crc = 0xFFFF;

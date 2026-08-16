@@ -382,7 +382,6 @@ static void stepper_set_rpm(float rpm)
    the VFD serial port or state variables directly.
    ========================================================================== */
 
-/* CRC-16/IBM (Modbus) — process one byte at a time */
 /* Drive DE high, send frame, wait for all bytes to leave the UART FIFO,
    then drive DE low to release the bus for the response. */
 static void vfd_send_frame(const uint8_t *frame, uint8_t len)
@@ -1219,6 +1218,7 @@ static bool vfd_web_locked()
     return digitalRead(VFD_LOCK_BTN) == HIGH;
 }
 
+/* POST /set — sets the hobbing ratio (hob threads : gear teeth) */
 static void handle_set()
 {
     if (!origin_ok()) { server.send(403, "text/plain", "Forbidden"); return; }
@@ -1553,6 +1553,12 @@ static void lvgl_delay(uint32_t ms)
     }
 }
 
+/* Tears down whatever radio state exists and brings up wifi_mode (STA or AP),
+   blocking for up to ~20s on a STA connection attempt before falling back to
+   AP. Called from loop() (after a /set-wifi POST sets wifi_reconfig_pending,
+   or after the long-press-to-AP button gesture) and once from setup() on
+   boot — never called from inside a web handler directly, since it blocks
+   long enough to want handleClient() to have already returned first. */
 static void apply_wifi_config()
 {
     server.stop();
@@ -1788,10 +1794,12 @@ static void load_config()
     EEPROM.end();
 }
 
+/* Loads saved settings, registers every HTTP route, then brings up the radio
+   via apply_wifi_config(). Called once from setup(). */
 static void setup_wifi()
 {
     load_config();
-    server.collectHeaders("Origin");
+    server.collectHeaders("Origin");   /* needed for origin_ok()'s CSRF check */
     server.on("/",             HTTP_GET,  handle_root);
     server.on("/set",          HTTP_POST, handle_set);
     server.on("/set-encoder",  HTTP_POST, handle_set_encoder);
@@ -1894,6 +1902,14 @@ void setup()
     setup_wifi();
 }
 
+/* Main loop, run once per Arduino core tick. Responsibilities, in order:
+   IP button / long-press-to-AP state machine, encoder → RPM → stepper speed
+   (also drives the tachometer needle/readout), LVGL rendering, the three VFD
+   physical buttons, the direction arrows, the speed potentiometer, the VFD
+   status poll, the onboard status LED, and the web server / DNS / pending
+   WiFi reconfig. Nothing here blocks for long except apply_wifi_config()
+   (button long-press or a pending web request), which pumps LVGL itself
+   while it waits so the display doesn't freeze during a WiFi (re)connect. */
 void loop()
 {
     /* Drive LVGL tick from millis() */
