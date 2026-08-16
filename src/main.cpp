@@ -378,9 +378,24 @@ static void stepper_set_rpm(float rpm)
    ========================================================================== */
 
 /* ==========================================================================
-   VFD MODBUS RTU — Yaskawa A1000 via SparkFun RS-485 Breakout on UART1
-   All VFD interaction is isolated here. Nothing outside this section touches
-   the VFD serial port or state variables directly.
+   VFD DRIVER ABSTRACTION — Yaskawa A1000 Modbus RTU implementation, via
+   SparkFun RS-485 Breakout on UART1.
+
+   Unlike the stepper section above, this isn't a clean two-function swap:
+   vfd_init(), vfd_run(), vfd_reverse(), vfd_stop(), vfd_reset_fault(),
+   vfd_set_freq(), and vfd_poll() are ALL Yaskawa/Modbus-specific (register
+   addresses, command/status bit layout — see a1000_modbus.h) and would all
+   need reimplementing for a different VFD or a non-Modbus control scheme
+   (e.g. 0-10V analog speed control). What the rest of the firmware — web
+   handlers, physical buttons, the potentiometer, loop() — actually depends
+   on is just that boundary: those seven functions, plus the state variables
+   they maintain (vfd_running, vfd_reverse_active, vfd_status_word,
+   vfd_fault_code, vfd_output_freq, vfd_comms_ok). Nothing outside this
+   section should call vfd_send_frame()/vfd_recv_frame()/vfd_read_regs()/
+   vfd_write_reg() or decode a status/command bit itself — if you find code
+   outside this section doing that, it's a bug (this happened once already:
+   handle_vfd_status() used to duplicate vfd_poll()'s register read instead
+   of calling it).
    ========================================================================== */
 
 /* Drive DE high, send frame, wait for all bytes to leave the UART FIFO,
@@ -676,7 +691,7 @@ static void vfd_init()
 }
 
 /* ==========================================================================
-   END VFD MODBUS RTU
+   END VFD DRIVER ABSTRACTION
    ========================================================================== */
 
 /* ---- Compute required stepper RPM from encoder RPM and apply it ---- */
@@ -1418,28 +1433,13 @@ static void handle_vfd_settings()
 
 static void handle_vfd_status()
 {
-    /* Do a live read of the status word so reverse/running always reflect
-       the drive's actual state, not the cached values from the last poll.
-       See vfd_poll() for why this reads 5 registers (not 6) and where the
-       fault code actually comes from. */
-    uint16_t live_regs[5];
-    bool live_ok = vfd_read_regs(A1000_REG_STATUS_1, 5, live_regs);
-    if (live_ok) {
-        vfd_status_word = live_regs[0];
-        vfd_output_freq = live_regs[4];
-        vfd_running        = (vfd_status_word & A1000_STATUS1_DURING_RUN) != 0;
-        if (vfd_running && (millis() - vfd_dir_cmd_ms >= VFD_DIR_SYNC_GRACE_MS))
-            vfd_reverse_active = (vfd_status_word & A1000_STATUS1_DURING_REVERSE) != 0;
-        if ((vfd_status_word & A1000_STATUS1_FAULT) != 0) {
-            uint16_t fault_reg[1];
-            if (vfd_read_regs(A1000_REG_CURRENT_FAULT, 1, fault_reg)) vfd_fault_code = fault_reg[0];
-        } else {
-            vfd_fault_code = 0;
-        }
-        vfd_comms_ok = true;
-    } else {
-        vfd_comms_ok = false;
-    }
+    /* Force a fresh poll (rather than waiting for loop()'s next scheduled
+       one) so a web client always sees current state — but through the same
+       vfd_poll() that owns all VFD state, not a second, independent read.
+       This is the VFD driver's swap boundary (see the "VFD DRIVER
+       ABSTRACTION" section above vfd_init()): nothing outside that section
+       should touch the bus or decode protocol-specific bits itself. */
+    vfd_poll();
 
     /* Pot is considered active if the ADC reads meaningfully above zero,
        meaning a potentiometer is wired to the pin and controlling speed. */

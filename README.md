@@ -343,6 +343,12 @@ The TMC5160-specific code is isolated in two functions inside a clearly marked s
 
 To substitute a different driver (e.g. a step/dir driver like a DRV8825), replace only those two functions plus the `#include`, pin defines, and driver object. Everything else — ratio calculation, web UI, EEPROM, display — is untouched.
 
+## VFD Driver Abstraction
+
+The VFD side has the same *kind* of boundary as the stepper, but it's a bigger swap. Seven functions in the clearly marked "VFD DRIVER ABSTRACTION" section of [`src/main.cpp`](src/main.cpp) — `vfd_init()`, `vfd_run()`, `vfd_reverse()`, `vfd_stop()`, `vfd_reset_fault()`, `vfd_set_freq()`, `vfd_poll()` — are the only things the rest of the firmware (web handlers, physical buttons, the potentiometer, `loop()`) calls, along with the state variables they maintain (`vfd_running`, `vfd_reverse_active`, `vfd_status_word`, `vfd_fault_code`, `vfd_output_freq`, `vfd_comms_ok`).
+
+Unlike the stepper, though, all seven of those functions are themselves Yaskawa A1000/Modbus RTU-specific — the register addresses and bit layout in [`include/a1000_modbus.h`](include/a1000_modbus.h) — so swapping to a different VFD (a different Modbus register map, or a non-Modbus scheme like 0–10V analog speed control) means reimplementing all seven, not replacing two functions like the stepper. What you get from the boundary is that nothing *else* in the firmware needs to change — no web handler, button, or display code knows or cares that the VFD talks Modbus.
+
 ## EEPROM Layout
 
 Settings are stored in 148 bytes of emulated EEPROM:
