@@ -11,6 +11,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
+#include "modbus_crc.h"
 
 /* ---- Display size (must match lv_conf.h) ---- */
 #define DISP_HOR_RES 240
@@ -41,7 +42,8 @@ static volatile uint32_t pulley_driven  = 1;   /* Teeth on output-side pulley   
 #define VFD_BTN_REVERSE    5        /* VFD Reverse (run reverse) — pulled up, active LOW */
 #define VFD_BTN_STOP       6        /* VFD Stop — pulled up, active LOW */
 #define RPM_SRC_BTN       16        /* RPM source select — held LOW = VFD, open = encoder */
-#define VFD_LOCK_BTN      22        /* Web VFD control lockout — held LOW = controls disabled */
+#define VFD_LOCK_BTN      22        /* Web VFD control lockout jumper — must be present (LOW)
+                                        to unlock; absent/open (HIGH) fails safe to locked */
 #define VFD_POT_PIN       26        /* RPM potentiometer wiper — ADC0 (GPIO 26) */
 #define VFD_POT_DEADBAND  32        /* ADC counts of change required to trigger a write (~0.5 Hz hysteresis) */
 #define VFD_POT_MIN       100       /* ADC counts at full CCW — maps to 0 Hz (tune if needed) */
@@ -54,6 +56,13 @@ static volatile uint32_t pulley_driven  = 1;   /* Teeth on output-side pulley   
 #define VFD_DE_PIN      7           /* RS-485 DE/RE — HIGH = transmit, LOW = receive */
 #define VFD_BAUD        9600
 #define VFD_POLL_MS     500         /* Status poll interval */
+#define VFD_DIR_SYNC_GRACE_MS  3000 /* After we command a direction, ignore the drive's
+                                       reported direction bit for this long — the drive
+                                       ramps to 0 before actually reversing, so polling
+                                       mid-ramp would read the old direction and clobber
+                                       our just-issued command, causing the arrow to blink
+                                       back to the old direction before settling. Tune this
+                                       to be longer than your VFD's decel+accel ramp time. */
 
 static uint8_t  vfd_slave      = 1;     /* Modbus slave address — runtime adjustable */
 static uint16_t vfd_max_hz     = 6000;  /* Max frequency setpoint (0.01 Hz units, 6000 = 60.00 Hz) */
@@ -75,6 +84,7 @@ static bool vfd_log_raw = false;
 /* Tracks the last commanded direction — shared between physical buttons and web handlers.
    false = forward, true = reverse. Start/Stop always uses this; Reverse flips it. */
 static bool vfd_reverse_active = false;
+static uint32_t vfd_dir_cmd_ms = 0;  /* millis() timestamp of the last local direction command */
 
 /* ---- WiFi ---- */
 #define WIFI_AP_SSID  "MTGizmo"
@@ -82,7 +92,8 @@ static bool vfd_reverse_active = false;
 #define WIFI_HOSTNAME "gizmo.mt"        /* DNS name in AP mode */
 
 enum WifiMode { MODE_AP, MODE_STA };
-static WifiMode   wifi_mode              = MODE_AP;
+static WifiMode   wifi_mode              = MODE_AP;  /* saved/configured mode (persisted, drives retry-on-reboot) */
+static WifiMode   current_wifi_mode      = MODE_AP;  /* actual live radio mode, for UI display */
 static String     sta_ssid               = "";
 static String     sta_password           = "";
 static bool       wifi_reconfig_pending  = false;  /* set by web handler, applied in loop() */
@@ -183,15 +194,21 @@ static void create_tachometer(void)
     lv_obj_set_style_text_opa(meter, LV_OPA_TRANSP, LV_PART_TICKS);
 
     /* Manually place labels 0–4 at the correct angular positions.
-       LVGL start_angle=150 is 150° CW from top (12-o'clock).
-       In standard trig (CCW from right): 150° CW from top = 300° CCW from right.
-       Each label step = 60° CW in screen = -60° in trig. */
+       The meter scale is lv_meter_set_scale_range(..., 0, 400, 240, 150): LVGL
+       angles are clockwise from 3-o'clock (east), so value v sits at
+       150 + (v/400)*240. For value = i*100 that's 150 + i*60 (i=0..4).
+       Converting LVGL's clockwise-from-east angle to this loop's CCW-from-east
+       trig convention (with ly = cy - r*sin) flips the sign: trig_angle =
+       -(150 + i*60) mod 360 = 210 - i*60, which should put i=2 ("2") at exactly
+       trig_angle=90 (straight up). In practice 210 still read slightly off on
+       the physical display (207 was too far CW, 210 too far CCW), so this is
+       tuned to 208.5 — re-adjust here if it still looks off. */
     static const char *tick_strs[] = { "0", "1", "2", "3", "4" };
     static const int label_r = 93;   /* radius from meter centre */
     static const int cx = 120;       /* meter centre x on screen */
     static const int cy = 120;       /* meter centre y on screen */
     for (int i = 0; i <= 4; i++) {
-        double angle_deg = 207.0 - i * 60.0;
+        double angle_deg = 208.5 - i * 60.0;
         double angle_rad = angle_deg * 3.14159265 / 180.0;
         int lx = (int)(cx + label_r * cos(angle_rad));
         int ly = (int)(cy - label_r * sin(angle_rad));
@@ -243,20 +260,23 @@ static void create_tachometer(void)
     lv_obj_set_style_text_font(rpm_readout, &lv_font_unscii_16, LV_PART_MAIN);
     lv_obj_center(rpm_readout);
 
-    /* Direction arrows — flanking the RPM readout box.
-       Right arrow (▶) = forward, left arrow (◀) = reverse.
-       Both start dim; update_direction_arrows() lights the active one green. */
+    /* Direction arrows — below the RPM readout box, tips flush with its left/right
+       edges. This keeps them in the gauge's dead zone (roughly the 120° arc
+       between the "0" and "4" tick labels, where the scale has no ticks and the
+       needle never sweeps) — the needle passes through the old pure-horizontal
+       (62,0)/(-62,0) row at ~450 RPM (left) and ~3450 RPM (right), so it visibly
+       crossed under a dark/lit arrow glyph there. */
     arrow_fwd = lv_label_create(lv_scr_act());
     lv_label_set_text(arrow_fwd, LV_SYMBOL_RIGHT LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(arrow_fwd, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
     lv_obj_set_style_text_font(arrow_fwd, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(arrow_fwd, LV_ALIGN_CENTER, 62, 0);   /* right of centre */
+    lv_obj_align_to(arrow_fwd, rpm_box, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 4);
 
     arrow_rev = lv_label_create(lv_scr_act());
     lv_label_set_text(arrow_rev, LV_SYMBOL_LEFT LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(arrow_rev, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
     lv_obj_set_style_text_font(arrow_rev, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(arrow_rev, LV_ALIGN_CENTER, -62, 0);  /* left of centre */
+    lv_obj_align_to(arrow_rev, rpm_box, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
 
     /* IP address overlay — dark pill centred on screen, hidden until button press */
     lv_obj_t *ip_box = lv_obj_create(lv_scr_act());
@@ -284,23 +304,23 @@ static void create_tachometer(void)
 static void show_overlay(const char *text, uint32_t duration_ms);   /* forward decl */
 
 /* Update the direction arrow colours based on current VFD state.
-   Active + running  → bright green
-   Active + stopped  → dim green  (shows selected direction at a glance)
-   Inactive          → near-black (invisible against dark background)   */
+   Running → bright green on whichever direction is active.
+   Stopped → both arrows off — the motor isn't spinning, and the next
+             Start could go either direction, so neither should be implied. */
 static void update_direction_arrows()
 {
+    lv_color_t off_col = lv_color_hex(0x2A2A2A);
+
     /* Forward arrow */
-    lv_color_t fwd_col;
-    if (!vfd_reverse_active && vfd_running)   fwd_col = lv_color_hex(0x00CC44);  /* bright green */
-    else if (!vfd_reverse_active)             fwd_col = lv_color_hex(0xCCAA00);  /* yellow */
-    else                                      fwd_col = lv_color_hex(0x2A2A2A);  /* off */
+    lv_color_t fwd_col = (vfd_running && !vfd_reverse_active)
+                              ? lv_color_hex(0x00CC44)  /* bright green */
+                              : off_col;
     lv_obj_set_style_text_color(arrow_fwd, fwd_col, LV_PART_MAIN);
 
     /* Reverse arrow */
-    lv_color_t rev_col;
-    if (vfd_reverse_active && vfd_running)    rev_col = lv_color_hex(0x00CC44);  /* bright green */
-    else if (vfd_reverse_active)              rev_col = lv_color_hex(0xCCAA00);  /* yellow */
-    else                                      rev_col = lv_color_hex(0x2A2A2A);  /* off */
+    lv_color_t rev_col = (vfd_running && vfd_reverse_active)
+                              ? lv_color_hex(0x00CC44)  /* bright green */
+                              : off_col;
     lv_obj_set_style_text_color(arrow_rev, rev_col, LV_PART_MAIN);
 }
 
@@ -363,19 +383,6 @@ static void stepper_set_rpm(float rpm)
    ========================================================================== */
 
 /* CRC-16/IBM (Modbus) — process one byte at a time */
-static uint16_t modbus_crc(const uint8_t *buf, uint8_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (uint8_t b = 0; b < 8; b++) {
-            if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
-            else              crc >>= 1;
-        }
-    }
-    return crc;
-}
-
 /* Drive DE high, send frame, wait for all bytes to leave the UART FIFO,
    then drive DE low to release the bus for the response. */
 static void vfd_send_frame(const uint8_t *frame, uint8_t len)
@@ -525,7 +532,11 @@ static bool vfd_run()
     vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0001);
     vfd_log_raw = false;
-    if (ok) vfd_running = true;
+    if (ok) {
+        vfd_running = true;
+        vfd_reverse_active = false;
+        vfd_dir_cmd_ms = millis();
+    }
     return ok;
 }
 
@@ -536,41 +547,11 @@ static bool vfd_reverse()
     vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0002);
     vfd_log_raw = false;
-    if (ok) vfd_running = true;
-    return ok;
-}
-
-/* Start sequence:
-   1. Send run-forward at freq=0 to put drive in running state
-   2. Poll drive to read actual direction state from status word
-   3. Send correct direction command
-   4. Restore current frequency setpoint */
-static bool vfd_start()
-{
-    Serial.println("[VFD] CMD start");
-    vfd_log_raw = true;
-
-    /* Step 1: enter running state at zero speed */
-    if (!vfd_write_reg(0x0002, 0x0000)) { vfd_log_raw = false; return false; }  /* freq = 0 */
-    if (!vfd_write_reg(0x0001, 0x0001)) { vfd_log_raw = false; return false; }  /* run fwd */
-    vfd_running = true;
-
-    /* Step 2: poll actual direction from drive status word */
-    uint16_t regs[1];
-    if (vfd_read_regs(0x0020, 1, regs)) {
-        vfd_status_word = regs[0];
-        vfd_reverse_active = (vfd_status_word & 0x0004) != 0;
-        Serial.printf("[VFD] start — drive status=0x%04X reverse=%d\n",
-                      vfd_status_word, vfd_reverse_active);
+    if (ok) {
+        vfd_running = true;
+        vfd_reverse_active = true;
+        vfd_dir_cmd_ms = millis();
     }
-
-    /* Step 3: send correct direction */
-    uint16_t dir_cmd = vfd_reverse_active ? 0x0002 : 0x0001;
-    if (!vfd_write_reg(0x0001, dir_cmd)) { vfd_log_raw = false; return false; }
-
-    /* Step 4: restore frequency setpoint */
-    bool ok = vfd_write_reg(0x0002, vfd_freq_ref);
-    vfd_log_raw = false;
     return ok;
 }
 
@@ -693,8 +674,12 @@ static void vfd_poll()
     vfd_running     = (new_status & 0x0001) != 0;     /* bit 0: During Run */
     /* Sync intended direction from drive only while running — when stopped the
        drive reports bit 2 = 0 regardless, so we preserve vfd_reverse_active
-       so Start correctly resumes in the last-running direction. */
-    if (vfd_running)
+       so Start correctly resumes in the last-running direction. Skip the sync
+       for a grace period after we issue a direction command: the drive ramps
+       to 0 before actually reversing, so a poll mid-ramp would still report
+       the old direction and clobber the command we just sent, causing the
+       arrow to flash back to the old direction before settling correctly. */
+    if (vfd_running && (millis() - vfd_dir_cmd_ms >= VFD_DIR_SYNC_GRACE_MS))
         vfd_reverse_active = (new_status & 0x0004) != 0;  /* bit 2: Reverse Running */
 }
 
@@ -829,21 +814,6 @@ static const String WEB_PAGE =
     /* ---- Home page ---- */
     "<div class='page active' id='pageHome'>"
     "<h1>Machine Tool Gizmo</h1>"
-    "<div class='card'>"
-    "<h2>Gear Ratio</h2>"
-    "<label>Current ratio</label>"
-    "<div class='current' id='cur'>__HOB__ : __TEETH__</div>"
-    "<form id='fRatio'>"
-    "<label for='hobVal'>Threads on hob</label>"
-    "<input type='number' id='hobVal' name='hob' min='1' max='9999' step='1'"
-    " placeholder='e.g. 1' required style='margin-top:6px'>"
-    "<label for='teethVal' style='margin-top:10px'>Gear teeth</label>"
-    "<input type='number' id='teethVal' name='teeth' min='1' max='9999' step='1'"
-    " placeholder='e.g. 32' required style='margin-top:6px'>"
-    "<button type='submit' style='margin-top:14px'>Set Ratio</button>"
-    "</form>"
-    "<div class='msg' id='msgRatio'></div>"
-    "</div>"
     /* ---- VFD card (Home tab) ---- */
     "<div class='card'>"
     "<h2>VFD — Yaskawa A1000</h2>"
@@ -880,8 +850,23 @@ static const String WEB_PAGE =
     "border-radius:6px;color:#ccc;font-size:.9rem;cursor:pointer'>Reset</button>"
     "</div>"
     "<div id='vfdLockNote' style='display:none;font-size:.8rem;color:#888;"
-    "margin-top:4px'>Controls locked by hardware switch</div>"
+    "margin-top:4px'>Controls locked — unlock jumper not present</div>"
     "<div class='msg' id='msgVfd'></div>"
+    "</div>"
+    "<div class='card'>"
+    "<h2>Gear Ratio</h2>"
+    "<label>Current ratio</label>"
+    "<div class='current' id='cur'>__HOB__ : __TEETH__</div>"
+    "<form id='fRatio'>"
+    "<label for='hobVal'>Threads on hob</label>"
+    "<input type='number' id='hobVal' name='hob' min='1' max='9999' step='1'"
+    " placeholder='e.g. 1' required style='margin-top:6px'>"
+    "<label for='teethVal' style='margin-top:10px'>Gear teeth</label>"
+    "<input type='number' id='teethVal' name='teeth' min='1' max='9999' step='1'"
+    " placeholder='e.g. 32' required style='margin-top:6px'>"
+    "<button type='submit' style='margin-top:14px'>Set Ratio</button>"
+    "</form>"
+    "<div class='msg' id='msgRatio'></div>"
     "</div>"
     "</div>"
     /* ---- Settings page ---- */
@@ -1071,7 +1056,7 @@ static const String WEB_PAGE =
     "var url='/set-wifi?mode='+encodeURIComponent(m)"
     "+'&ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p);"
     "showMsg('msgWifi','Applying... reconnect if needed.',false);"
-    "try{await fetch(url,{method:'GET'});}catch(e){}"
+    "try{await fetch(url,{method:'POST'});}catch(e){}"
     "});"
     /* pulley form */
     "document.getElementById('fPulley').addEventListener('submit',async function(e){"
@@ -1187,7 +1172,7 @@ static void handle_root()
     page.replace("__PULLEY_DRV__", pulley_drv_buf);
     page.replace("__PULLEY_DRN__", pulley_drn_buf);
     page.replace("__IP__",       current_ip);
-    page.replace("__WIFIMODE__", wifi_mode == MODE_AP ? "AP" : "STA");
+    page.replace("__WIFIMODE__", current_wifi_mode == MODE_AP ? "AP" : "STA");
     page.replace("__APSEL__",    wifi_mode == MODE_AP  ? "selected" : "");
     page.replace("__STASEL__",   wifi_mode == MODE_STA ? "selected" : "");
     /* VFD settings placeholders */
@@ -1206,8 +1191,37 @@ static void handle_root()
     server.send(200, "text/html", page);
 }
 
+/* CSRF guard: browsers always send Origin on cross-site POSTs (it can't be
+   spoofed by page JS), so reject any request whose Origin doesn't match this
+   device. A request with no Origin header at all (curl, direct API clients)
+   is allowed through — there's no session/token scheme here to check instead,
+   so this only stops the classic "malicious page silently POSTs to a known
+   LAN IP" attack, not a deliberate direct request. */
+static bool origin_ok()
+{
+    String origin = server.header("Origin");
+    if (origin.length() == 0) return true;
+    return origin == ("http://" + current_ip);
+}
+
+/* Physical lockout jumper (VFD_LOCK_BTN, INPUT_PULLUP). Fail-safe: the pin
+   must be actively pulled LOW by the jumper being physically present to
+   UNLOCK. Any absence of that connection — jumper not installed, wire
+   broken, connector unplugged — reads HIGH and defaults to LOCKED. This is
+   the opposite sense of a normal "hold to disable" switch on purpose: a
+   safety interlock must fail toward the safe state, not the enabled one.
+   Must be checked inside every handler that can start/reverse/reconfigure
+   the spindle — the web UI only grays out buttons client-side, which is not
+   a real guarantee. Stop is deliberately never gated by this: a lockout must
+   never be able to block the one command that makes the machine safer. */
+static bool vfd_web_locked()
+{
+    return digitalRead(VFD_LOCK_BTN) == HIGH;
+}
+
 static void handle_set()
 {
+    if (!origin_ok()) { server.send(403, "text/plain", "Forbidden"); return; }
     if (!server.hasArg("hob") || !server.hasArg("teeth")) {
         server.send(400, "text/plain", "Missing hob or teeth parameter");
         return;
@@ -1228,6 +1242,7 @@ static void handle_set()
 
 static void handle_set_encoder()
 {
+    if (!origin_ok()) { server.send(403, "text/plain", "Forbidden"); return; }
     if (!server.hasArg("reversed")) {
         server.send(400, "text/plain", "Missing parameter");
         return;
@@ -1240,6 +1255,7 @@ static void handle_set_encoder()
 
 static void handle_set_ppr()
 {
+    if (!origin_ok()) { server.send(403, "text/plain", "Forbidden"); return; }
     if (!server.hasArg("ppr")) {
         server.send(400, "text/plain", "Missing ppr parameter");
         return;
@@ -1258,6 +1274,7 @@ static void handle_set_ppr()
 
 static void handle_set_pulley()
 {
+    if (!origin_ok()) { server.send(403, "text/plain", "Forbidden"); return; }
     if (!server.hasArg("driver") || !server.hasArg("driven")) {
         server.send(400, "text/plain", "Missing driver or driven parameter");
         return;
@@ -1283,16 +1300,23 @@ static uint32_t g_ip_show_until = 0;
 
 static void handle_vfd_run()
 {
+    if (!origin_ok())     { server.send(403, "text/plain", "Forbidden"); return; }
+    if (vfd_web_locked()) { server.send(403, "text/plain", "VFD control locked"); return; }
     bool ok = vfd_run();
     server.send(ok ? 200 : 502, "text/plain", ok ? "Forward command sent" : "VFD comms error");
 }
 
 static void handle_vfd_reverse()
 {
+    if (!origin_ok())     { server.send(403, "text/plain", "Forbidden"); return; }
+    if (vfd_web_locked()) { server.send(403, "text/plain", "VFD control locked"); return; }
     bool ok = vfd_reverse();
     server.send(ok ? 200 : 502, "text/plain", ok ? "Reverse command sent" : "VFD comms error");
 }
 
+/* Deliberately not gated by origin_ok() or vfd_web_locked(): Stop must always
+   go through, from any source, lockout engaged or not. Never make the safe
+   direction harder to reach than the dangerous one. */
 static void handle_vfd_stop()
 {
     bool ok = vfd_stop();
@@ -1301,12 +1325,16 @@ static void handle_vfd_stop()
 
 static void handle_vfd_reset()
 {
+    if (!origin_ok())     { server.send(403, "text/plain", "Forbidden"); return; }
+    if (vfd_web_locked()) { server.send(403, "text/plain", "VFD control locked"); return; }
     bool ok = vfd_reset_fault();
     server.send(ok ? 200 : 502, "text/plain", ok ? "Fault reset sent" : "VFD comms error");
 }
 
 static void handle_vfd_freq()
 {
+    if (!origin_ok())     { server.send(403, "text/plain", "Forbidden"); return; }
+    if (vfd_web_locked()) { server.send(403, "text/plain", "VFD control locked"); return; }
     if (!server.hasArg("hz")) {
         server.send(400, "text/plain", "Missing hz parameter");
         return;
@@ -1318,13 +1346,15 @@ static void handle_vfd_freq()
     }
     bool ok = vfd_set_freq((uint16_t)val);
     char buf[32];
-    snprintf(buf, sizeof(buf), ok ? "Freq set: %.2f Hz" : "VFD comms error",
-             val / 100.0f);
+    if (ok) snprintf(buf, sizeof(buf), "Freq set: %.2f Hz", val / 100.0f);
+    else    snprintf(buf, sizeof(buf), "VFD comms error");
     server.send(ok ? 200 : 502, "text/plain", buf);
 }
 
 static void handle_vfd_rpm()
 {
+    if (!origin_ok())     { server.send(403, "text/plain", "Forbidden"); return; }
+    if (vfd_web_locked()) { server.send(403, "text/plain", "VFD control locked"); return; }
     if (!server.hasArg("rpm")) {
         server.send(400, "text/plain", "Missing rpm parameter");
         return;
@@ -1366,6 +1396,8 @@ static void handle_vfd_rpm()
 
 static void handle_vfd_settings()
 {
+    if (!origin_ok())     { server.send(403, "text/plain", "Forbidden"); return; }
+    if (vfd_web_locked()) { server.send(403, "text/plain", "VFD control locked"); return; }
     if (!server.hasArg("slave") || !server.hasArg("maxhz") ||
         !server.hasArg("basehz") || !server.hasArg("baserpm")) {
         server.send(400, "text/plain", "Missing parameter");
@@ -1413,7 +1445,7 @@ static void handle_vfd_status()
         vfd_fault_code  = live_regs[1];
         vfd_output_freq = live_regs[5];
         vfd_running        = (vfd_status_word & 0x0001) != 0;
-        if (vfd_running)
+        if (vfd_running && (millis() - vfd_dir_cmd_ms >= VFD_DIR_SYNC_GRACE_MS))
             vfd_reverse_active = (vfd_status_word & 0x0004) != 0;
         vfd_comms_ok = true;
     } else {
@@ -1424,8 +1456,7 @@ static void handle_vfd_status()
        meaning a potentiometer is wired to the pin and controlling speed. */
     bool pot_active = (analogRead(VFD_POT_PIN) > 50);
 
-    /* Lockout button: LOW = web VFD controls disabled */
-    bool web_lock = (digitalRead(VFD_LOCK_BTN) == LOW);
+    bool web_lock = vfd_web_locked();
 
     char buf[240];
     snprintf(buf, sizeof(buf),
@@ -1482,6 +1513,7 @@ static void handle_wifi_scan()
 
 static void handle_set_wifi()
 {
+    if (!origin_ok()) { server.send(403, "text/plain", "Forbidden"); return; }
     if (!server.hasArg("mode")) {
         server.send(400, "text/plain", "Missing mode");
         return;
@@ -1549,10 +1581,12 @@ static void apply_wifi_config()
 
         if (WiFi.status() == WL_CONNECTED) {
             current_ip = WiFi.localIP().toString();
+            current_wifi_mode = MODE_STA;
             show_overlay((sta_ssid + "\n" + current_ip).c_str(), 5000);
         } else {
             /* STA failed — fall back to AP visually but DO NOT change wifi_mode
-               so saved config still has STA and will retry on next reboot */
+               so saved config still has STA and will retry on next reboot.
+               current_wifi_mode DOES change, so the UI reflects the live radio state. */
             show_overlay(("Failed: " + sta_ssid + "\n" + WIFI_AP_SSID).c_str(), 4000);
             lvgl_delay(500);
 
@@ -1561,6 +1595,7 @@ static void apply_wifi_config()
             WiFi.softAPConfig(local, local, IPAddress(255, 255, 255, 0));
             WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
             current_ip = "192.168.4.1";
+            current_wifi_mode = MODE_AP;
             dnsServer.start(53, "*", local);
             server.begin();
             return;   /* return early — don't save, preserving STA config */
@@ -1576,6 +1611,7 @@ static void apply_wifi_config()
         WiFi.softAPConfig(local, local, IPAddress(255, 255, 255, 0));
         WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
         current_ip = "192.168.4.1";
+        current_wifi_mode = MODE_AP;
         dnsServer.start(53, "*", local);
 
         /* duration_ms=0 → stays visible until explicitly hidden or overwritten;
@@ -1755,12 +1791,13 @@ static void load_config()
 static void setup_wifi()
 {
     load_config();
+    server.collectHeaders("Origin");
     server.on("/",             HTTP_GET,  handle_root);
     server.on("/set",          HTTP_POST, handle_set);
     server.on("/set-encoder",  HTTP_POST, handle_set_encoder);
     server.on("/set-ppr",      HTTP_POST, handle_set_ppr);
     server.on("/set-pulley",   HTTP_POST, handle_set_pulley);
-    server.on("/set-wifi",     HTTP_GET,  handle_set_wifi);
+    server.on("/set-wifi",     HTTP_POST, handle_set_wifi);
     server.on("/wifi-scan",    HTTP_GET,  handle_wifi_scan);
     server.on("/vfd-rpm",      HTTP_POST, handle_vfd_rpm);
     server.on("/vfd-run",      HTTP_POST, handle_vfd_run);
@@ -1833,6 +1870,26 @@ void setup()
     /* ---- Initialise VFD serial port ---- */
     vfd_init();
 
+    /* Load vfd_slave (and other settings) before commanding the drive, so the
+       safety stop below targets the correct Modbus address. */
+    load_config();
+
+    /* Safety: force the drive to a known-stopped state on every boot/reset.
+       The drive has no idea "the controller just restarted" — if it was left
+       running before a crash, reflash, or power blip, it keeps spinning right
+       through the reboot unless we explicitly tell it to stop. Retry briefly
+       in case the RS-485 bus / drive isn't ready the instant we power up. */
+    {
+        bool stopped = false;
+        for (uint8_t attempt = 0; attempt < 5 && !stopped; attempt++) {
+            stopped = vfd_stop();
+            if (!stopped) delay(200);
+        }
+        Serial.println(stopped
+            ? "[VFD] boot safety stop OK"
+            : "[VFD] boot safety stop FAILED — no comms yet, will retry via vfd_poll()");
+    }
+
     /* ---- Start WiFi AP and web server ---- */
     setup_wifi();
 }
@@ -1895,6 +1952,7 @@ void loop()
 
     if (now - last_rpm_ms >= RPM_UPDATE_MS)
     {
+        uint32_t elapsed_ms = now - last_rpm_ms;
         last_rpm_ms = now;
 
         /* Always keep the encoder state current so stepper tracking stays accurate */
@@ -1905,7 +1963,7 @@ void loop()
         int32_t delta   = current_pos - last_pos;
         last_pos        = current_pos;
 
-        int32_t raw_rpm = (delta * 60000L) / ((int32_t)encoder_ppr * RPM_UPDATE_MS);
+        int32_t raw_rpm = (delta * 60000L) / ((int32_t)encoder_ppr * (int32_t)elapsed_ms);
         if (raw_rpm >  (int32_t)METER_MAX_RPM) raw_rpm =  (int32_t)METER_MAX_RPM;
         if (raw_rpm < -(int32_t)METER_MAX_RPM) raw_rpm = -(int32_t)METER_MAX_RPM;
 

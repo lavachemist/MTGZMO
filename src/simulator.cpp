@@ -26,6 +26,7 @@
    ============================================================================= */
 
 #include <Arduino.h>
+#include "modbus_crc.h"
 
 /* ---- RS-485 pins ---- */
 #define SIM_TX_PIN   8      /* Serial2 TX → MAX485 DI  */
@@ -45,19 +46,6 @@ static bool     sim_dir_change  = false;  /* true when ramping to 0 before a dir
 static uint16_t sim_fault_code  = 0;      /* 0 = no fault */
 
 /* ---- Helpers ---- */
-
-static uint16_t modbus_crc(const uint8_t *buf, uint8_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (uint8_t b = 0; b < 8; b++) {
-            if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
-            else              crc >>= 1;
-        }
-    }
-    return crc;
-}
 
 static void send_frame(const uint8_t *frame, uint8_t len)
 {
@@ -126,7 +114,7 @@ static bool read_register(uint16_t addr, uint16_t &value)
             return true;
         default:
             /* Valid-looking but unimplemented registers return 0 */
-            if (addr <= 0x007F || (addr >= 0x0020 && addr <= 0x0046)) {
+            if (addr <= 0x007F) {
                 value = 0;
                 return true;
             }
