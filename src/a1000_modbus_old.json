@@ -1,0 +1,346 @@
+{
+  "device": "Yaskawa A1000 AC Drive",
+  "protocol": "MEMOBUS/Modbus RTU",
+  "notes": [
+    "Factory default slave address: 1F (hex) = 31 (dec), set via parameter H5-01.",
+    "Broadcast address 00 is write-only; no response is returned.",
+    "Default baud rate: 9600 bps (H5-02 = 3). Supported: 1200, 2400, 4800, 9600, 19200, 38400 bps.",
+    "Default data format: 8-N-2 (H5-03 = 0). Options: 8-N-1, 8-E-1, 8-O-1, 8-N-2.",
+    "Register addresses: use the Yaskawa MEMOBUS register number directly as the PDU address. No offset is applied.",
+    "Example: command register is MEMOBUS register 0001 → PDU address 0x0001.",
+    "Frequency reference and monitor values are in units of 0.01 Hz (e.g. 6000 = 60.00 Hz).",
+    "All multi-byte values in the PDU are big-endian (high byte first), per standard Modbus RTU.",
+    "CRC is CRC-16/IBM (polynomial 0x8005 reflected = 0xA001), initialised to 0xFFFF, appended little-endian (low byte first on wire).",
+    "The A1000 uses standard Modbus RTU framing. There is no 0x4000 address offset on the A1000; that scheme applies to some older Yaskawa drives (e.g. G7/P7) only.",
+    "b1-01 must be set to 2 (Modbus) for frequency reference commands to take effect.",
+    "b1-02 must be set to 2 (Modbus) for run/stop/direction commands to take effect."
+  ],
+  "communication_parameters": {
+    "H5-01": { "name": "Drive Slave Address",            "range": "0–1F (hex)",  "default": "1F (= 31 dec)", "note": "Set to match the master's configured slave address." },
+    "H5-02": { "name": "Baud Rate",                      "range": "0–5",         "default": "3",  "map": { "0": "1200", "1": "2400", "2": "4800", "3": "9600", "4": "19200", "5": "38400" } },
+    "H5-03": { "name": "Communication Parity / Stop Bits","range": "0–3",         "default": "0",  "map": { "0": "8-N-2", "1": "8-E-1", "2": "8-O-1", "3": "8-N-1" } },
+    "H5-04": { "name": "Stopping Method on Comm Error",  "range": "0–3",         "default": "3",  "map": { "0": "Ramp to stop", "1": "Coast to stop", "2": "Fast stop", "3": "Continue operation" } },
+    "H5-05": { "name": "Communication Fault Detection",  "range": "0–1",         "default": "1",  "map": { "0": "Disabled", "1": "Enabled" } },
+    "H5-06": { "name": "Drive Transmit Wait Time",       "range": "5–65 ms",     "default": "5",  "note": "Delay between receiving a request and sending the response. Master must wait at least this long after asserting DE before expecting a response." },
+    "H5-07": { "name": "RTS Control",                    "range": "0–1",         "default": "1",  "map": { "0": "RTS always ON", "1": "RTS controlled (DE-style half-duplex)" } }
+  },
+  "required_parameter_setup": {
+    "description": "These parameters must be set on the A1000 before Modbus control is active.",
+    "b1-01": { "register": "0x0180", "value": 2, "description": "Frequency Reference Source = Modbus RTU" },
+    "b1-02": { "register": "0x0181", "value": 2, "description": "Run Command Source = Modbus RTU" }
+  },
+  "function_codes": {
+    "01": { "name": "Read Coil Status",               "description": "Read coil (discrete output) ON/OFF status. Returns 1 bit per coil." },
+    "02": { "name": "Read Input Status",              "description": "Read discrete input status. Returns 1 bit per input." },
+    "03": { "name": "Read Holding Registers",         "description": "Read one or more 16-bit holding registers. Used for monitors and parameters. Response: [slave][03][byte_count][data HI][data LO]...[CRC_LO][CRC_HI]." },
+    "06": { "name": "Write Single Register",          "description": "Write a single 16-bit holding register. Used for command word, frequency reference, or a single parameter. Drive echoes the request unchanged on success." },
+    "08": { "name": "Loopback Test",                  "description": "Diagnostics loopback. Sub-function 0x0000 echoes the data word back unchanged." },
+    "10": { "name": "Write Multiple Registers (FC 16)","description": "Write multiple consecutive 16-bit holding registers in one message. Useful for writing command word and frequency reference simultaneously." },
+    "note": "Read functions (01, 02, 03) cannot use broadcast address 00. Write functions (06, 10) may use address 00 with no response returned."
+  },
+  "command_registers": {
+    "description": "Write these registers to control the drive. b1-01 and b1-02 must both be set to 2 (Modbus).",
+    "registers": {
+      "0001": {
+        "name": "Command Register (MEMOBUS Command Word)",
+        "address_hex": "0001",
+        "address_dec": 1,
+        "access": "R/W",
+        "description": "Primary drive control word. Write to command run, stop, direction, and fault reset.",
+        "bits": {
+          "0":  { "name": "Forward Run",         "description": "1 = Run forward. Bit 1 must be 0 when this bit is set." },
+          "1":  { "name": "Reverse Run",         "description": "1 = Run reverse. Bit 0 must be 0 when this bit is set." },
+          "2":  { "name": "External Fault (EF0)","description": "1 = Trigger external fault EF0." },
+          "3":  { "name": "Fault Reset",         "description": "1 = Reset active fault (rising edge triggers reset; clear to 0 after reset)." },
+          "4":  { "name": "Multi-step Ref Bit 0","description": "Speed reference selection bit 0 (used when d1 multi-step speed is configured)." },
+          "5":  { "name": "Multi-step Ref Bit 1","description": "Speed reference selection bit 1." },
+          "6":  { "name": "Jog Command",         "description": "1 = Jog reference selected." },
+          "7":  { "name": "Accel/Decel Select",  "description": "1 = Use accel/decel time 2 (C1-03 / C1-04)." },
+          "8":  { "name": "Baseblock (N.O.)",    "description": "1 = Baseblock output (output transistors off, motor coasts)." },
+          "9":  { "name": "Torque Reference",    "description": "1 = Switch to torque reference (OLV/CLV modes only)." },
+          "10": { "name": "Speed/Torque Sel",    "description": "1 = Torque control active." },
+          "11": { "name": "Emergency Stop",      "description": "1 = Emergency stop (EF0 triggered)." },
+          "12": { "name": "KEB (Kinetic Energy Brake)", "description": "1 = Activate KEB." },
+          "13": { "name": "Drive Enable",        "description": "1 = Drive enabled (only relevant when drive-enable input function is configured)." },
+          "14": { "name": "Reserved",            "description": "Always write 0." },
+          "15": { "name": "Reserved",            "description": "Always write 0." }
+        },
+        "common_command_words": {
+          "0x0000": "Stop",
+          "0x0001": "Run forward",
+          "0x0002": "Run reverse",
+          "0x0008": "Fault reset (set, then clear to 0x0000)"
+        }
+      },
+      "0002": {
+        "name": "Frequency Reference",
+        "address_hex": "0002",
+        "address_dec": 2,
+        "access": "R/W",
+        "description": "Speed/frequency setpoint. Effective only when b1-01 = 2 (Modbus).",
+        "units": "0.01 Hz per count",
+        "range": "0–40000 (0.00–400.00 Hz)",
+        "examples": { "6000": "60.00 Hz", "3000": "30.00 Hz", "5000": "50.00 Hz" }
+      },
+      "0003": {
+        "name": "PID Feedback Reference (via Modbus)",
+        "address_hex": "0003",
+        "address_dec": 3,
+        "access": "R/W",
+        "description": "PID feedback setpoint when Modbus is selected as PID feedback source.",
+        "units": "0.01% of max frequency"
+      }
+    }
+  },
+  "status_registers": {
+    "description": "Read-only registers reporting drive state. Use FC 03 to read.",
+    "registers": {
+      "0020": {
+        "name": "Status Register (MEMOBUS Status Word)",
+        "address_hex": "0020",
+        "address_dec": 32,
+        "access": "R",
+        "description": "Primary drive status word.",
+        "bits": {
+          "0":  { "name": "During Run",                       "description": "1 = Drive output is active (running)." },
+          "1":  { "name": "Zero Speed",                       "description": "1 = Output frequency is at or below zero-speed level." },
+          "2":  { "name": "Reverse Running",                  "description": "1 = Drive is running in reverse direction." },
+          "3":  { "name": "Reset",                            "description": "1 = Drive has been reset." },
+          "4":  { "name": "Speed Agree",                      "description": "1 = Output frequency matches frequency reference (within agree width)." },
+          "5":  { "name": "Drive Ready",                      "description": "1 = Drive is ready to run (no fault, not in baseblock)." },
+          "6":  { "name": "Minor Fault (Alarm)",              "description": "1 = Alarm active (non-trip condition)." },
+          "7":  { "name": "Major Fault",                      "description": "1 = Fault active (drive tripped)." },
+          "8":  { "name": "oPE Fault",                        "description": "1 = Operator programming error present." },
+          "9":  { "name": "UV (Undervoltage)",                "description": "1 = DC bus undervoltage detected." },
+          "10": { "name": "Baseblock",                        "description": "1 = Output is in baseblock (transistors off)." },
+          "11": { "name": "Frequency Reference from Modbus",  "description": "1 = Frequency reference source is Modbus (b1-01 = 2)." },
+          "12": { "name": "Run Command from Modbus",          "description": "1 = Run command source is Modbus (b1-02 = 2)." },
+          "13": { "name": "During Overtorque/Undertorque",    "description": "1 = Overtorque or undertorque detection active." },
+          "14": { "name": "Frequency Reference Loss",         "description": "1 = Frequency reference signal loss detected." },
+          "15": { "name": "Reserved",                         "description": "Always 0." }
+        }
+      },
+      "0021": {
+        "name": "Fault Code",
+        "address_hex": "0021",
+        "address_dec": 33,
+        "access": "R",
+        "description": "Active fault code. 0x00 = no fault. See fault_codes section for all values."
+      },
+      "0022": {
+        "name": "Alarm Code",
+        "address_hex": "0022",
+        "address_dec": 34,
+        "access": "R",
+        "description": "Active alarm (minor fault) code. 0x00 = no alarm."
+      },
+      "0023": {
+        "name": "Drive Status 2",
+        "address_hex": "0023",
+        "address_dec": 35,
+        "access": "R",
+        "description": "Secondary status word.",
+        "bits": {
+          "0": { "name": "KEB Active",           "description": "1 = KEB (Kinetic Energy Braking) is active." },
+          "1": { "name": "During Deceleration",  "description": "1 = Drive is decelerating." },
+          "2": { "name": "During Acceleration",  "description": "1 = Drive is accelerating." },
+          "3": { "name": "During Speed Search",  "description": "1 = Speed search is active." },
+          "4": { "name": "EF0 Active",           "description": "1 = External fault EF0 triggered." },
+          "5": { "name": "Reserved",             "description": "Always 0." },
+          "6": { "name": "Reserved",             "description": "Always 0." },
+          "7": { "name": "Reserved",             "description": "Always 0." }
+        }
+      }
+    }
+  },
+  "monitor_registers": {
+    "description": "Read-only monitor values. Use FC 03 to read.",
+    "registers": {
+      "0025": { "name": "Output Frequency",           "address_hex": "0025", "access": "R", "units": "0.01 Hz",  "range": "0–40000", "description": "Actual output frequency to motor. 6000 = 60.00 Hz." },
+      "0026": { "name": "Output Current",             "address_hex": "0026", "access": "R", "units": "0.1 A",    "description": "Actual output current. 100 = 10.0 A." },
+      "0027": { "name": "Output Voltage Reference",   "address_hex": "0027", "access": "R", "units": "0.1 V",    "description": "Output voltage reference. 2400 = 240.0 V." },
+      "0028": { "name": "DC Bus Voltage",             "address_hex": "0028", "access": "R", "units": "1 V",      "description": "DC bus voltage in volts." },
+      "002A": { "name": "Output Power",               "address_hex": "002A", "access": "R", "units": "0.1 kW",   "description": "Output power. 100 = 10.0 kW." },
+      "002C": { "name": "Torque Reference / Estimated Torque", "address_hex": "002C", "access": "R", "units": "0.1%", "description": "Torque reference or estimated torque as percentage of rated motor torque." },
+      "002D": { "name": "Frequency Reference Monitor","address_hex": "002D", "access": "R", "units": "0.01 Hz",  "description": "Active frequency reference from whatever source is selected." },
+      "002F": { "name": "Drive Temperature (Heatsink)","address_hex": "002F", "access": "R", "units": "1 °C",    "description": "Heatsink temperature." },
+      "0040": { "name": "Cumulative Operation Time",  "address_hex": "0040", "access": "R", "units": "1 hour",   "description": "Total drive power-on hours." },
+      "0041": { "name": "kWh Monitor (Low Word)",     "address_hex": "0041", "access": "R", "units": "1 kWh",    "description": "Cumulative energy, low 16-bit word." },
+      "0042": { "name": "kWh Monitor (High Word)",    "address_hex": "0042", "access": "R", "units": "1 kWh",    "description": "Cumulative energy, high 16-bit word. Full value = (0042 << 16) | 0041." },
+      "0044": { "name": "PID Feedback Monitor",       "address_hex": "0044", "access": "R", "units": "0.01%",    "description": "PID feedback value." },
+      "0045": { "name": "PID Input (Error) Monitor",  "address_hex": "0045", "access": "R", "units": "0.01%",    "description": "PID input (setpoint minus feedback)." },
+      "0046": { "name": "PID Output Monitor",         "address_hex": "0046", "access": "R", "units": "0.01%",    "description": "PID controller output." }
+    }
+  },
+  "parameter_registers": {
+    "description": "Drive parameters accessed via holding registers. Use FC 03 to read, FC 06 or FC 10 to write. Writing parameters while running may be restricted depending on the parameter.",
+    "common_parameters": {
+      "0100": { "parameter": "A1-02", "name": "Control Method",         "description": "0=V/f, 1=V/f w/PG, 2=OLV, 3=CLV, 6=AOLV, 7=CLV/PM" },
+      "0101": { "parameter": "A1-03", "name": "Initialize",             "description": "2220 = 2-wire init, 3330 = 3-wire init, 5550 = user init" },
+      "0180": { "parameter": "b1-01", "name": "Frequency Ref Source",   "description": "0=keypad, 1=analog, 2=Modbus, 3=option, 4=pulse" },
+      "0181": { "parameter": "b1-02", "name": "Run Command Source",     "description": "0=keypad, 1=terminals, 2=Modbus, 3=option" },
+      "0183": { "parameter": "b1-04", "name": "Reverse Operation",      "description": "0=enabled, 1=disabled" },
+      "0201": { "parameter": "C1-01", "name": "Accel Time 1",           "units": "0.1 s",    "description": "0.0–6000.0 s" },
+      "0202": { "parameter": "C1-02", "name": "Decel Time 1",           "units": "0.1 s",    "description": "0.0–6000.0 s" },
+      "0203": { "parameter": "C1-03", "name": "Accel Time 2",           "units": "0.1 s",    "description": "0.0–6000.0 s" },
+      "0204": { "parameter": "C1-04", "name": "Decel Time 2",           "units": "0.1 s",    "description": "0.0–6000.0 s" },
+      "0280": { "parameter": "d1-01", "name": "Frequency Reference 1",  "units": "0.01 Hz",  "description": "Preset speed 1" },
+      "0281": { "parameter": "d1-02", "name": "Frequency Reference 2",  "units": "0.01 Hz",  "description": "Preset speed 2" },
+      "0282": { "parameter": "d1-03", "name": "Frequency Reference 3",  "units": "0.01 Hz",  "description": "Preset speed 3" },
+      "0283": { "parameter": "d1-04", "name": "Frequency Reference 4",  "units": "0.01 Hz",  "description": "Preset speed 4" },
+      "0291": { "parameter": "d2-01", "name": "Frequency Upper Limit",  "units": "0.1%",     "description": "Maximum output frequency limit" },
+      "0292": { "parameter": "d2-02", "name": "Frequency Lower Limit",  "units": "0.1%",     "description": "Minimum output frequency limit" },
+      "0300": { "parameter": "E1-01", "name": "Input Voltage Setting",  "units": "1 V",      "description": "Nominal motor input voltage" },
+      "0303": { "parameter": "E1-04", "name": "Max Output Frequency",   "units": "0.01 Hz",  "description": "FMAX" },
+      "0304": { "parameter": "E1-05", "name": "Max Output Voltage",     "units": "0.1 V",    "description": "VMAX" },
+      "0308": { "parameter": "E1-09", "name": "Min Output Frequency",   "units": "0.01 Hz",  "description": "FMIN" },
+      "0310": { "parameter": "E2-01", "name": "Motor Rated Current",    "units": "0.01 A",   "description": "FLA" },
+      "0311": { "parameter": "E2-02", "name": "Motor Rated Slip",       "units": "0.01 Hz",  "description": "Rated slip frequency" },
+      "0312": { "parameter": "E2-03", "name": "Motor No-Load Current",  "units": "0.01 A",   "description": "Magnetising current" },
+      "0313": { "parameter": "E2-04", "name": "Motor Poles",            "description": "Number of motor poles" },
+      "0314": { "parameter": "E2-05", "name": "Motor Line-to-Line Resistance", "units": "0.001 Ω", "description": "Phase resistance" },
+      "0320": { "parameter": "H5-01", "name": "Slave Address",          "description": "0x01–0x1F (1–31 dec). Factory default: 0x1F." },
+      "0321": { "parameter": "H5-02", "name": "Baud Rate Select",       "description": "0=1200, 1=2400, 2=4800, 3=9600, 4=19200, 5=38400" },
+      "0322": { "parameter": "H5-03", "name": "Communication Parity",   "description": "0=8-N-2, 1=8-E-1, 2=8-O-1, 3=8-N-1" },
+      "0323": { "parameter": "H5-04", "name": "Stop on Comm Error",     "description": "0=ramp, 1=coast, 2=fast stop, 3=continue" },
+      "0324": { "parameter": "H5-05", "name": "Comm Fault Detection",   "description": "0=disabled, 1=enabled" },
+      "0325": { "parameter": "H5-06", "name": "TX Wait Time",           "units": "1 ms",     "description": "5–65 ms. Master must wait at least this long after DE goes low before expecting the response." },
+      "0326": { "parameter": "H5-07", "name": "RTS Control",            "description": "0=always ON, 1=RTS controlled" }
+    }
+  },
+  "exception_responses": {
+    "description": "If the drive cannot process a request it responds with the function code OR'd with 0x80, followed by an exception code and CRC.",
+    "format": "[Slave Addr] [(FC | 0x80)] [Exception Code] [CRC_LO] [CRC_HI]",
+    "example": "01 83 02 C0 F1 = slave 01, FC 03 error, exception 02 (illegal data address)",
+    "codes": {
+      "01": { "name": "Illegal Function",     "description": "The function code is not supported." },
+      "02": { "name": "Illegal Data Address", "description": "The register address is out of range or does not exist." },
+      "03": { "name": "Illegal Data Value",   "description": "The data value is outside the parameter's allowable range." },
+      "04": { "name": "Slave Device Failure", "description": "Drive could not execute the request due to an internal error." },
+      "05": { "name": "Acknowledge",          "description": "Drive accepted the command but processing will take time; poll for completion." },
+      "06": { "name": "Slave Device Busy",    "description": "Drive is busy processing a previous command." }
+    }
+  },
+  "example_messages": {
+    "description": "Complete raw Modbus RTU byte sequences with correct CRC-16/IBM values. Format: [slave][FC][...data...][CRC_LO][CRC_HI]. All CRC values verified.",
+    "read_status_register": {
+      "description": "Read status register (0x0020) from slave 01",
+      "request":  "01 03 00 20 00 01 85 C0",
+      "response": "01 03 02 XX XX [CRC_LO] [CRC_HI]",
+      "response_note": "XX XX = 16-bit status word, high byte first. Example: 00 21 = bits 0 and 5 set (Running + Ready)."
+    },
+    "read_status_and_fault": {
+      "description": "Read both status (0x0020) and fault code (0x0021) in one request from slave 01",
+      "request":  "01 03 00 20 00 02 C5 C1",
+      "response": "01 03 04 XX XX YY YY [CRC_LO] [CRC_HI]",
+      "response_note": "XX XX = status word, YY YY = fault code. 4 data bytes total."
+    },
+    "read_output_frequency": {
+      "description": "Read actual output frequency (0x0025) from slave 01",
+      "request":  "01 03 00 25 00 01 95 C1",
+      "response": "01 03 02 17 70 B6 50",
+      "response_note": "0x1770 = 6000 = 60.00 Hz"
+    },
+    "read_multiple_monitors": {
+      "description": "Read 6 monitor registers starting at 0x0025 (output freq, current, voltage, DC bus, reserved, power) from slave 01",
+      "request":  "01 03 00 25 00 06 D4 03",
+      "response": "01 03 0C [12 data bytes] [CRC_LO] [CRC_HI]",
+      "response_note": "0x0C = 12 bytes = 6 registers × 2 bytes each."
+    },
+    "set_frequency_60hz": {
+      "description": "Set frequency reference to 60.00 Hz (6000 = 0x1770) on slave 01",
+      "request":  "01 06 00 02 17 70 26 1E",
+      "response": "01 06 00 02 17 70 26 1E",
+      "response_note": "FC 06 success: drive echoes the full request unchanged."
+    },
+    "run_forward": {
+      "description": "Run forward (command word bit 0 = 1) on slave 01",
+      "request":  "01 06 00 01 00 01 19 CA",
+      "response": "01 06 00 01 00 01 19 CA"
+    },
+    "run_reverse": {
+      "description": "Run reverse (command word bit 1 = 1, bit 0 must be 0) on slave 01",
+      "request":  "01 06 00 01 00 02 59 CB",
+      "response": "01 06 00 01 00 02 59 CB"
+    },
+    "stop": {
+      "description": "Stop (command word all zeros) on slave 01",
+      "request":  "01 06 00 01 00 00 D8 0A",
+      "response": "01 06 00 01 00 00 D8 0A"
+    },
+    "fault_reset": {
+      "description": "Reset active fault on slave 01. Step 1: set bit 3 (rising edge). Step 2: clear to 0.",
+      "step1_request":  "01 06 00 01 00 08 D9 CC",
+      "step1_response": "01 06 00 01 00 08 D9 CC",
+      "step2_request":  "01 06 00 01 00 00 D8 0A",
+      "step2_response": "01 06 00 01 00 00 D8 0A",
+      "note": "Wait at least 50 ms between step 1 and step 2."
+    },
+    "run_forward_and_set_freq_together": {
+      "description": "Write command word (run forward) and frequency reference (60.00 Hz) in one FC 10 transaction on slave 01",
+      "request":  "01 10 00 01 00 02 04 00 01 17 70 6D B7",
+      "response": "01 10 00 01 00 02 10 08",
+      "response_note": "FC 10 success response echoes start address (00 01) and register count (00 02)."
+    },
+    "loopback_test": {
+      "description": "FC 08 loopback diagnostic (sub-function 0x0000) to slave 01. Drive echoes the two data bytes unchanged.",
+      "request":  "01 08 00 00 AB CD 5E AE",
+      "response": "01 08 00 00 AB CD 5E AE"
+    }
+  },
+  "fault_codes": {
+    "description": "Values returned in register 0x0021 when the drive has tripped. 0x00 = no fault.",
+    "codes": {
+      "00": "No fault",
+      "01": "oC  — Overcurrent",
+      "02": "ov  — Overvoltage",
+      "03": "oH1 — Heatsink overheat",
+      "04": "oH2 — Internal overheat",
+      "05": "oL1 — Motor overload (OL1)",
+      "06": "oL2 — Drive overload (OL2)",
+      "07": "oL3 — Overtorque 1",
+      "08": "oL4 — Overtorque 2",
+      "09": "rr  — DB transistor fault",
+      "0A": "rH  — DB resistor overheat",
+      "0B": "EF  — External fault (terminal input)",
+      "0C": "EF0 — External fault (Modbus command word bit 2)",
+      "0D": "EF1 — External fault (terminal S1)",
+      "0E": "EF2 — External fault (terminal S2)",
+      "0F": "EF3 — External fault (terminal S3)",
+      "10": "PF  — Input phase loss",
+      "11": "LF  — Output phase loss",
+      "12": "oH3 — Motor overheat (thermistor PTC)",
+      "13": "oS  — Overspeed",
+      "14": "dEv — Speed deviation",
+      "15": "PGo — PG open (encoder disconnected)",
+      "17": "CE  — Modbus communication error",
+      "18": "bUS — Option card communication error",
+      "19": "CALL — Serial communication wait",
+      "1A": "UL3 — Undertorque 1",
+      "1B": "UL4 — Undertorque 2",
+      "1E": "SC  — Output short circuit / ground fault",
+      "1F": "UV1 — DC bus undervoltage",
+      "20": "UV2 — Control power supply undervoltage",
+      "21": "UV3 — Soft-charge circuit fault",
+      "22": "SE  — EEPROM write error",
+      "23": "CPF — Control circuit fault",
+      "24": "oH4 — Drive overheat pre-alarm",
+      "2F": "STo — Pull-out detection (PM motor)",
+      "30": "EtH — Motor overheat (thermistor NTC)",
+      "31": "LSo — Low speed detection",
+      "38": "oL7 — High slip braking overload",
+      "3A": "HCA — High current alarm"
+    }
+  },
+  "scaling_summary": {
+    "frequency":        { "unit": "0.01 Hz",  "example": "6000 = 60.00 Hz",   "register_range": "0–40000" },
+    "current":          { "unit": "0.1 A",    "example": "150 = 15.0 A" },
+    "voltage":          { "unit": "0.1 V",    "example": "2400 = 240.0 V" },
+    "dc_bus_voltage":   { "unit": "1 V",      "example": "340 = 340 V" },
+    "power":            { "unit": "0.1 kW",   "example": "75 = 7.5 kW" },
+    "temperature":      { "unit": "1 °C",     "example": "45 = 45 °C" },
+    "torque":           { "unit": "0.1%",     "example": "1000 = 100.0% of rated torque" },
+    "accel_decel_time": { "unit": "0.1 s",    "example": "100 = 10.0 s" },
+    "resistance":       { "unit": "0.001 Ω",  "example": "1500 = 1.500 Ω" }
+  }
+}
