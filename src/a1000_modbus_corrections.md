@@ -70,9 +70,35 @@ Old file called `0022H` "Alarm Code" (it's actually **Data Link Status** — EEP
 
 Old file used the standard/generic Modbus exception codes (`01`=Illegal Function, `02`=Illegal Data Address, `03`=Illegal Data Value, `04`=Slave Device Failure, `05`=Acknowledge, `06`=Slave Device Busy). The real A1000 (Technical Manual p.733) uses its own set: `01`/`02`/`03` are conceptually similar (Function Code / Register Number / Bit Count errors) but the drive also defines `21H`–`25H` (Data Setting Error, Write Mode Error, DC Bus Undervoltage Write Error, Write Error During Parameter Process, Writing into EEPROM Disabled) that the old file didn't have at all, and codes `04`–`06` don't exist on the A1000.
 
+### 8. `parameter_registers` — systematic per-group address offsets
+
+A follow-up pass checked every remaining entry against Technical Manual Appendix B (the parameter address tables: B.3 for `A1`, B.4 for `b1`, B.5 for `C1`, B.6 for `d1`/`d2`, B.7 for `E1`/`E2`). Several were wrong by a consistent offset *per parameter group* — not random noise, which is a strong sign they were interpolated/guessed rather than read off a real table:
+
+| Parameter | Old file said | Actually is | Offset |
+|---|---|---|---|
+| `A1-02` | `0100H` | `0102H` | −2 |
+| `A1-03` | `0101H` | `0103H` | −2 |
+| `C1-01` | `0201H` | `0200H` | +1 |
+| `C1-02` | `0202H` | `0201H` | +1 |
+| `C1-03` | `0203H` | `0202H` | +1 |
+| `C1-04` | `0204H` | `0203H` | +1 |
+| `d2-01` | `0291H` | `0289H` | +8 |
+| `d2-02` | `0292H` | `028AH` | +8 |
+| `E2-01` | `0310H` | `030EH` | +2 |
+| `E2-02` | `0311H` | `030FH` | +2 |
+| `E2-03` | `0312H` | `0310H` | +2 |
+| `E2-04` | `0313H` | `0311H` | +2 |
+| `E2-05` | `0314H` | `0312H` | +2 |
+
+`b1-01` (`0180H`), `b1-02` (`0181H`), `b1-04` (`0183H`), `d1-01`–`d1-04` (`0280H`–`0283H`), and `E1-01`/`E1-04`/`E1-05`/`E1-09` (`0300H`/`0303H`/`0304H`/`0308H`) were all already correct.
+
+**Impact:** low in practice for this project specifically — `main.cpp` never writes any of these parameter addresses at runtime (it only relies on `b1-01`/`b1-02` being set correctly on the drive itself, via the front panel, which this file's addresses don't affect either way). But anyone scripting a parameter backup/restore tool or a first-time-setup wizard against the *old* file's addresses would have silently written to the wrong parameter.
+
+Every entry in `parameter_registers` is now individually verified; the section-level `"verified"` flag was updated from `false` to `true`. `required_parameter_setup`'s `b1-01`/`b1-02` addresses were also confirmed correct and flipped from `"verified": false` to `true`.
+
 ## What's still unverified
 
-The `parameter_registers` section (drive parameter addresses like `A1-02`, `C1-01`, `E1-04`, etc.) was **not** re-checked line-by-line against the manual in this pass — only `d1-01` (confirmed at `0280H`) and the `H5-0x` communication parameters (moved into `communication_parameters` with confirmed addresses) were verified. Everything else in that section is carried over from the old file and marked `"verified": false`. Cross-check any specific entry there before writing to it.
+Everything in the file has now been checked against the manual, with one exception: the exact decimal precision of the Output Power monitor (register `0027H`) — the manual's table lists its unit as `kW` without stating a scaling factor the way it does for current (`0.1 A`) or torque (`0.1%`), and no other page in the manual sections reviewed clarified it. `scaling_summary.power` is left without a `"verified"` flag for this reason; treat `0.1 kW` as a reasonable-but-unconfirmed assumption.
 
 ## Suggested next step
 
