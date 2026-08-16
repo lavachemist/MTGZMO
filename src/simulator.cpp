@@ -14,21 +14,23 @@
      FC 03  Read Holding Registers
      FC 06  Write Single Register
 
-   Simulated registers — matches the real A1000's actual MEMOBUS/Modbus map
-   (Yaskawa Technical Manual SIEP C710616 41H; see src/a1000_modbus.json and
-   a1000_modbus_corrections.md for how this was verified — an earlier version
-   of this simulator, and of main.cpp, used a fabricated map that didn't match
-   the real drive):
-     0x0001  Command word  (R/W) — bit 0 = fwd, bit 1 = rev, bit 3 = fault reset
-     0x0002  Frequency reference (R/W) — 0.01 Hz units
-     0x0020  Drive Status 1 (R) — bit0 During Run, bit1 During Reverse,
-             bit2 Drive Ready, bit3 Fault, bit14 ComRef enabled, bit15 ComCtrl
-             enabled
-     0x0021  Fault Contents 1 (R) — bitmask, not a decodable code; simplified
-             here to bit 0 set whenever any fault is active
-     0x0024  Output Frequency (R) — tracks freq ref when running
-     0x0080  Current Fault code (R) — parameter U2-01; this is the register
-             that actually decodes to a fault name (Table C.6), unlike 0x0021
+   Simulated registers — matches the real A1000's actual MEMOBUS/Modbus map,
+   using the same shared definitions (include/a1000_modbus.h) as main.cpp so
+   the two can never drift apart again the way they did before (see
+   src/a1000_modbus.json and a1000_modbus_corrections.md for how the map was
+   verified against the official Yaskawa Technical Manual, SIEP C710616 41H):
+     A1000_REG_CMD_WORD      (0x0001) Command word (R/W) — bit 0 = fwd,
+                              bit 1 = rev, bit 3 = fault reset
+     A1000_REG_FREQ_REF      (0x0002) Frequency reference (R/W) — 0.01 Hz units
+     A1000_REG_STATUS_1      (0x0020) Drive Status 1 (R)
+     A1000_REG_FAULT_BITMASK_1 (0x0021) Fault Contents 1 (R) — bitmask, not a
+                              decodable code; simplified here to bit 0 set
+                              whenever any fault is active
+     A1000_REG_OUTPUT_FREQ   (0x0024) Output Frequency (R) — tracks freq ref
+                              when running
+     A1000_REG_CURRENT_FAULT (0x0080) Current Fault code (R) — parameter
+                              U2-01; the register that actually decodes to a
+                              fault name (Table C.6), unlike 0x0021
 
    All other registers return 0x0000 on read; writes to unknown registers
    return Modbus exception 02 (Illegal Data Address).
@@ -36,6 +38,7 @@
 
 #include <Arduino.h>
 #include "modbus_crc.h"
+#include "a1000_modbus.h"
 
 /* ---- RS-485 pins ---- */
 #define SIM_TX_PIN   8      /* Serial2 TX → MAX485 DI  */
@@ -91,40 +94,38 @@ static void send_exception(uint8_t fc, uint8_t code)
 static bool read_register(uint16_t addr, uint16_t &value)
 {
     switch (addr) {
-        case 0x0001: {
+        case A1000_REG_CMD_WORD: {
             /* Command word — reflect current state back */
             uint16_t cmd = 0;
-            if (sim_running && !sim_reverse) cmd = 0x0001;
-            if (sim_running &&  sim_reverse) cmd = 0x0002;
+            if (sim_running && !sim_reverse) cmd = A1000_CMD_WORD_RUN_FORWARD;
+            if (sim_running &&  sim_reverse) cmd = A1000_CMD_WORD_RUN_REVERSE;
             value = cmd;
             return true;
         }
-        case 0x0002:
+        case A1000_REG_FREQ_REF:
             value = sim_freq_ref;
             return true;
-        case 0x0020: {
-            /* Drive Status 1 */
+        case A1000_REG_STATUS_1: {
             uint16_t status = 0;
-            if (sim_running)      status |= (1 << 0);   /* During Run */
-            if (sim_reverse)      status |= (1 << 1);   /* During Reverse */
-            if (!sim_fault_code)  status |= (1 << 2);   /* Drive Ready (no active fault) */
-            if (sim_fault_code)   status |= (1 << 3);   /* Fault */
-            status |= (1 << 14);                        /* ComRef enabled */
-            status |= (1 << 15);                        /* ComCtrl enabled */
+            if (sim_running)      status |= A1000_STATUS1_DURING_RUN;
+            if (sim_reverse)      status |= A1000_STATUS1_DURING_REVERSE;
+            if (!sim_fault_code)  status |= A1000_STATUS1_DRIVE_READY;
+            if (sim_fault_code)   status |= A1000_STATUS1_FAULT;
+            status |= A1000_STATUS1_COMREF_ENABLED;
+            status |= A1000_STATUS1_COMCTRL_ENABLED;
             value = status;
             return true;
         }
-        case 0x0021:
+        case A1000_REG_FAULT_BITMASK_1:
             /* Fault Contents 1 bitmask — simplified to "some fault active" */
             value = sim_fault_code ? 0x0001 : 0x0000;
             return true;
-        case 0x0024:
+        case A1000_REG_OUTPUT_FREQ:
             value = sim_output_freq;
             return true;
-        case 0x0080:
-            /* U2-01 Current Fault — the register that actually decodes to a
-               fault name; see fault_and_alarm_codes.current_fault_code in
-               a1000_modbus.json for the real code values. */
+        case A1000_REG_CURRENT_FAULT:
+            /* The register that actually decodes to a fault name via
+               a1000_current_fault_name() — see a1000_modbus.h. */
             value = sim_fault_code;
             return true;
         default:
@@ -140,11 +141,11 @@ static bool read_register(uint16_t addr, uint16_t &value)
 static bool write_register(uint16_t addr, uint16_t value)
 {
     switch (addr) {
-        case 0x0001: {
+        case A1000_REG_CMD_WORD: {
             /* Command word */
-            bool fwd   = (value & 0x0001) != 0;
-            bool rev   = (value & 0x0002) != 0;
-            bool reset = (value & 0x0008) != 0;
+            bool fwd   = (value & A1000_CMD_FORWARD_RUN) != 0;
+            bool rev   = (value & A1000_CMD_REVERSE_RUN) != 0;
+            bool reset = (value & A1000_CMD_FAULT_RESET) != 0;
 
             if (reset) {
                 sim_fault_code  = 0;
@@ -178,7 +179,7 @@ static bool write_register(uint16_t addr, uint16_t value)
             }
             return true;
         }
-        case 0x0002:
+        case A1000_REG_FREQ_REF:
             sim_freq_ref = value;
             return true;
         default:
