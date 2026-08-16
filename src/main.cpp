@@ -74,7 +74,7 @@ static volatile uint16_t vfd_status_word  = 0;
 static volatile uint16_t vfd_fault_code   = 0;
 static volatile bool     vfd_running      = false;
 static volatile uint16_t vfd_freq_ref     = 0;   /* last written frequency reference */
-static volatile uint16_t vfd_output_freq  = 0;   /* actual output frequency (reg 0x0025) */
+static volatile uint16_t vfd_output_freq  = 0;   /* actual output frequency (reg 0x0024) */
 static volatile bool     vfd_comms_ok     = false;
 
 /* When false, raw TX/RX byte dumps and FC03 OK lines are suppressed.
@@ -592,40 +592,62 @@ static bool vfd_set_freq(uint16_t hz_hundredths)
 }
 
 /* Decode fault code to a short string.  Returns pointer to a string literal. */
+/* Decodes the value of MEMOBUS/Modbus register 0x0080 (parameter U2-01,
+   "Current Fault") — NOT register 0x0021, which is a bitmask of fault
+   categories ("Fault Contents 1"), not a single enumerated code. Codes below
+   are Table C.6 "Fault Trace / History Register Contents" from the Yaskawa
+   A1000 Technical Manual (SIEP C710616 41H), trimmed to the entries most
+   relevant here — see src/a1000_modbus.json / a1000_modbus_corrections.md
+   for the full table and how this was verified. */
 static const char *vfd_fault_name(uint16_t code)
 {
     switch (code) {
-        case 0x01: return "oC — Overcurrent";
-        case 0x02: return "ov — Overvoltage";
-        case 0x03: return "oH1 — Heatsink overheat";
-        case 0x04: return "oH2 — Internal overheat";
-        case 0x05: return "oL1 — Motor overload";
-        case 0x06: return "oL2 — Drive overload";
-        case 0x07: return "oL3 — Overtorque 1";
-        case 0x08: return "oL4 — Overtorque 2";
-        case 0x09: return "rr — DB transistor fault";
-        case 0x0A: return "rH — DB resistor overheat";
-        case 0x0B: return "EF — External fault";
-        case 0x0C: return "EF0 — Modbus fault";
-        case 0x0D: return "EF1 — External fault S1";
-        case 0x0E: return "EF2 — External fault S2";
-        case 0x0F: return "EF3 — External fault S3";
-        case 0x10: return "PF — Input phase loss";
-        case 0x11: return "LF — Output phase loss";
-        case 0x12: return "oH3 — Motor overheat";
-        case 0x13: return "oS — Overspeed";
-        case 0x14: return "dEv — Speed deviation";
-        case 0x15: return "PGo — PG open";
-        case 0x17: return "CE — Modbus comm error";
-        case 0x18: return "bUS — Option comm error";
-        case 0x1E: return "SC — Short circuit/GND";
-        case 0x1F: return "UV1 — DC undervoltage";
-        case 0x20: return "UV2 — Ctrl supply UV";
-        case 0x21: return "UV3 — Soft-charge fault";
-        case 0x22: return "SE — EEPROM write error";
-        case 0x23: return "CPF — Control circuit";
-        case 0x24: return "oH4 — Drive overheat";
-        default:   return "Unknown fault";
+        case 0x0002: return "Uv1 — DC bus undervoltage";
+        case 0x0003: return "Uv2 — Control supply undervoltage";
+        case 0x0004: return "Uv3 — Soft-charge fault";
+        case 0x0005: return "SC — Output short-circuit/IGBT fault";
+        case 0x0006: return "GF — Ground fault";
+        case 0x0007: return "oC — Overcurrent";
+        case 0x0008: return "ov — Overvoltage";
+        case 0x0009: return "oH — Heatsink overheat";
+        case 0x000A: return "oH1 — Heatsink overheat 1";
+        case 0x000B: return "oL1 — Motor overload";
+        case 0x000C: return "oL2 — Drive overload";
+        case 0x000D: return "oL3 — Overtorque 1";
+        case 0x000E: return "oL4 — Overtorque 2";
+        case 0x000F: return "rr — DB transistor fault";
+        case 0x0010: return "rH — DB resistor overheat";
+        case 0x0011: return "EF3 — External fault, terminal S3";
+        case 0x0012: return "EF4 — External fault, terminal S4";
+        case 0x0013: return "EF5 — External fault, terminal S5";
+        case 0x0014: return "EF6 — External fault, terminal S6";
+        case 0x0015: return "EF7 — External fault, terminal S7";
+        case 0x0016: return "EF8 — External fault, terminal S8";
+        case 0x0017: return "FAn — Internal fan fault";
+        case 0x0018: return "oS — Overspeed";
+        case 0x0019: return "dEv — Speed deviation";
+        case 0x001A: return "PGo — PG disconnect";
+        case 0x001B: return "PF — Input phase loss";
+        case 0x001C: return "LF — Output phase loss";
+        case 0x001D: return "oH3 — Motor overheat (PTC)";
+        case 0x001E: return "oPr — Digital operator connection fault";
+        case 0x001F: return "Err — EEPROM write error";
+        case 0x0020: return "oH4 — Motor overheat (PTC)";
+        case 0x0021: return "CE — Modbus communication error";
+        case 0x0022: return "bUS — Option communication error";
+        case 0x0025: return "CF — Control fault";
+        case 0x0026: return "SvE — Zero-servo fault";
+        case 0x0027: return "EF0 — Option external fault";
+        case 0x0028: return "FbL — PID feedback loss";
+        case 0x0029: return "UL3 — Undertorque detection 1";
+        case 0x002A: return "UL4 — Undertorque detection 2";
+        case 0x002B: return "oL7 — High slip braking overload";
+        case 0x0030: return "Hardware fault (incl. oFx)";
+        case 0x0050: return "oH5 — Motor overheat (NTC)";
+        case 0x0051: return "LSo — Low speed fault";
+        case 0x0052: return "nSE — Node setup fault";
+        case 0x0053: return "THo — Thermistor disconnect";
+        default:      return "Unknown/uncommon fault";
     }
 }
 
@@ -633,10 +655,14 @@ static const char *vfd_fault_name(uint16_t code)
    Shows overlay on new faults or on fault clearance. */
 static void vfd_poll()
 {
-    /* Read status (0x0020), fault code (0x0021), and output frequency (0x0025).
-       0x0022–0x0024 are contiguous monitor registers — read 6 to get 0x0020–0x0025. */
-    uint16_t regs[6];
-    bool ok = vfd_read_regs(0x0020, 6, regs);
+    /* Read Drive Status 1 (0x0020) through Output Frequency (0x0024) in one
+       transaction. NOTE: 0x0021 in this window is "Fault Contents 1", a
+       bitmask of fault categories — not a decodable fault code — so it's
+       read but not used for the fault name below. 0x0025 (excluded here)
+       is Output Voltage Reference, not Output Frequency; a prior version of
+       this code read regs[5]==0x0025 believing it was frequency. */
+    uint16_t regs[5];
+    bool ok = vfd_read_regs(0x0020, 5, regs);
     bool was_ok = vfd_comms_ok;
     vfd_comms_ok = ok;
     if (!ok) {
@@ -645,8 +671,18 @@ static void vfd_poll()
     }
 
     uint16_t new_status      = regs[0];   /* 0x0020 */
-    uint16_t new_fault       = regs[1];   /* 0x0021 */
-    uint16_t new_output_freq = regs[5];   /* 0x0025 */
+    uint16_t new_output_freq = regs[4];   /* 0x0024 */
+
+    /* The drive's actual decodable fault code lives at a separate,
+       non-contiguous register (0x0080, parameter U2-01 "Current Fault"),
+       not at 0x0021. Only fetch it when the status word's Fault bit (bit 3)
+       is set, so a healthy drive costs one Modbus transaction per poll
+       instead of two. */
+    uint16_t new_fault = 0;
+    if ((new_status & 0x0008) != 0) {
+        uint16_t fault_reg[1];
+        if (vfd_read_regs(0x0080, 1, fault_reg)) new_fault = fault_reg[0];
+    }
 
     /* Log any change in status word or fault code */
     if (new_status != vfd_status_word || new_fault != vfd_fault_code) {
@@ -672,14 +708,14 @@ static void vfd_poll()
     vfd_output_freq = new_output_freq;
     vfd_running     = (new_status & 0x0001) != 0;     /* bit 0: During Run */
     /* Sync intended direction from drive only while running — when stopped the
-       drive reports bit 2 = 0 regardless, so we preserve vfd_reverse_active
+       drive reports bit 1 = 0 regardless, so we preserve vfd_reverse_active
        so Start correctly resumes in the last-running direction. Skip the sync
        for a grace period after we issue a direction command: the drive ramps
        to 0 before actually reversing, so a poll mid-ramp would still report
        the old direction and clobber the command we just sent, causing the
        arrow to flash back to the old direction before settling correctly. */
     if (vfd_running && (millis() - vfd_dir_cmd_ms >= VFD_DIR_SYNC_GRACE_MS))
-        vfd_reverse_active = (new_status & 0x0004) != 0;  /* bit 2: Reverse Running */
+        vfd_reverse_active = (new_status & 0x0002) != 0;  /* bit 1: During Reverse */
 }
 
 /* Initialise UART and the DE pin.  Called once from setup().
@@ -1437,16 +1473,23 @@ static void handle_vfd_settings()
 static void handle_vfd_status()
 {
     /* Do a live read of the status word so reverse/running always reflect
-       the drive's actual state, not the cached values from the last poll. */
-    uint16_t live_regs[6];
-    bool live_ok = vfd_read_regs(0x0020, 6, live_regs);
+       the drive's actual state, not the cached values from the last poll.
+       See vfd_poll() for why this reads 5 registers (not 6) and where the
+       fault code actually comes from. */
+    uint16_t live_regs[5];
+    bool live_ok = vfd_read_regs(0x0020, 5, live_regs);
     if (live_ok) {
         vfd_status_word = live_regs[0];
-        vfd_fault_code  = live_regs[1];
-        vfd_output_freq = live_regs[5];
+        vfd_output_freq = live_regs[4];
         vfd_running        = (vfd_status_word & 0x0001) != 0;
         if (vfd_running && (millis() - vfd_dir_cmd_ms >= VFD_DIR_SYNC_GRACE_MS))
-            vfd_reverse_active = (vfd_status_word & 0x0004) != 0;
+            vfd_reverse_active = (vfd_status_word & 0x0002) != 0;  /* bit 1: During Reverse */
+        if ((vfd_status_word & 0x0008) != 0) {
+            uint16_t fault_reg[1];
+            if (vfd_read_regs(0x0080, 1, fault_reg)) vfd_fault_code = fault_reg[0];
+        } else {
+            vfd_fault_code = 0;
+        }
         vfd_comms_ok = true;
     } else {
         vfd_comms_ok = false;

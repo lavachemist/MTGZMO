@@ -14,12 +14,21 @@
      FC 03  Read Holding Registers
      FC 06  Write Single Register
 
-   Simulated registers:
+   Simulated registers — matches the real A1000's actual MEMOBUS/Modbus map
+   (Yaskawa Technical Manual SIEP C710616 41H; see src/a1000_modbus.json and
+   a1000_modbus_corrections.md for how this was verified — an earlier version
+   of this simulator, and of main.cpp, used a fabricated map that didn't match
+   the real drive):
      0x0001  Command word  (R/W) — bit 0 = fwd, bit 1 = rev, bit 3 = fault reset
      0x0002  Frequency reference (R/W) — 0.01 Hz units
-     0x0020  Status word   (R)
-     0x0021  Fault code    (R)
-     0x0025  Output frequency (R) — tracks freq ref when running
+     0x0020  Drive Status 1 (R) — bit0 During Run, bit1 During Reverse,
+             bit2 Drive Ready, bit3 Fault, bit14 ComRef enabled, bit15 ComCtrl
+             enabled
+     0x0021  Fault Contents 1 (R) — bitmask, not a decodable code; simplified
+             here to bit 0 set whenever any fault is active
+     0x0024  Output Frequency (R) — tracks freq ref when running
+     0x0080  Current Fault code (R) — parameter U2-01; this is the register
+             that actually decodes to a fault name (Table C.6), unlike 0x0021
 
    All other registers return 0x0000 on read; writes to unknown registers
    return Modbus exception 02 (Illegal Data Address).
@@ -94,23 +103,29 @@ static bool read_register(uint16_t addr, uint16_t &value)
             value = sim_freq_ref;
             return true;
         case 0x0020: {
-            /* Status word */
+            /* Drive Status 1 */
             uint16_t status = 0;
-            if (sim_running)  status |= (1 << 0);   /* During Run */
-            if (!sim_running) status |= (1 << 1);   /* Zero Speed */
-            if (sim_reverse)  status |= (1 << 2);   /* Reverse Running */
-            status |= (1 << 5);                     /* Drive Ready — always ready */
-            if (sim_fault_code) status |= (1 << 7); /* Major Fault */
-            status |= (1 << 11);                    /* Freq ref from Modbus */
-            status |= (1 << 12);                    /* Run cmd from Modbus */
+            if (sim_running)      status |= (1 << 0);   /* During Run */
+            if (sim_reverse)      status |= (1 << 1);   /* During Reverse */
+            if (!sim_fault_code)  status |= (1 << 2);   /* Drive Ready (no active fault) */
+            if (sim_fault_code)   status |= (1 << 3);   /* Fault */
+            status |= (1 << 14);                        /* ComRef enabled */
+            status |= (1 << 15);                        /* ComCtrl enabled */
             value = status;
             return true;
         }
         case 0x0021:
-            value = sim_fault_code;
+            /* Fault Contents 1 bitmask — simplified to "some fault active" */
+            value = sim_fault_code ? 0x0001 : 0x0000;
             return true;
-        case 0x0025:
+        case 0x0024:
             value = sim_output_freq;
+            return true;
+        case 0x0080:
+            /* U2-01 Current Fault — the register that actually decodes to a
+               fault name; see fault_and_alarm_codes.current_fault_code in
+               a1000_modbus.json for the real code values. */
+            value = sim_fault_code;
             return true;
         default:
             /* Valid-looking but unimplemented registers return 0 */
