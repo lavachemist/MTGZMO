@@ -617,11 +617,16 @@ static void vfd_poll()
     /* The drive's actual decodable fault code lives at a separate,
        non-contiguous register (A1000_REG_CURRENT_FAULT). Only fetch it when
        the status word's Fault bit is set, so a healthy drive costs one
-       Modbus transaction per poll instead of two. */
-    uint16_t new_fault = 0;
+       Modbus transaction per poll instead of two. Default to the last known
+       value (not 0) so a transient failure on just this second read doesn't
+       misreport an active fault as cleared. */
+    uint16_t new_fault = vfd_fault_code;
     if ((new_status & A1000_STATUS1_FAULT) != 0) {
         uint16_t fault_reg[1];
         if (vfd_read_regs(A1000_REG_CURRENT_FAULT, 1, fault_reg)) new_fault = fault_reg[0];
+        /* else: leave new_fault as the last known value — don't claim cleared */
+    } else {
+        new_fault = 0;   /* status word confirms no active fault */
     }
 
     /* Log any change in status word or fault code */
